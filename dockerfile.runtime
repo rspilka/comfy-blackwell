@@ -1,0 +1,165 @@
+
+# --- GLOBAL ARGS ---
+ARG BASE_IMAGE="nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04"
+ARG TARGET_IMAGE="nvidia/cuda:13.2.1-runtime-ubuntu24.04"
+ARG BUILD_TARGET="optimized"
+ARG UBUNTU_MIRROR="at.archive.ubuntu.com"
+ARG TORCH_CUDA_ARCH_LIST="10.0 12.0"
+ARG FORCE_CUDA="1"
+ARG NUNCHAKU_INSTALL_MODE="ALL" 
+ARG MAX_JOBS="2"
+ARG USERNAME="comfy"       
+ARG USER_UID=1000           
+ARG USER_GID=1000
+
+# --- STAGE 1: Builder-Base ---
+FROM ${BASE_IMAGE} AS stage-base
+ARG UBUNTU_MIRROR 
+ARG USERNAME       
+ARG USER_UID           
+ARG USER_GID
+
+# Identität und Infrastruktur in einem Layer
+RUN export G_OLD=$(getent group ${USER_GID} | cut -d: -f1) && \
+    if [ -n "$G_OLD" ]; then \
+        [ "$G_OLD" != "${USERNAME}" ] && groupmod -n ${USERNAME} "$G_OLD"; \
+    else \
+        groupadd -g ${USER_GID} ${USERNAME}; \
+    fi && \
+    export U_OLD=$(getent passwd ${USER_UID} | cut -d: -f1) && \
+    if [ -n "$U_OLD" ]; then \
+        if [ "$U_OLD" != "${USERNAME}" ]; then \
+            usermod -l ${USERNAME} -d /home/${USERNAME} -m -s /bin/bash "$U_OLD"; \
+        fi; \
+    else \
+        useradd -m -u ${USER_UID} -g ${USER_GID} -s /bin/bash ${USERNAME}; \
+    fi && \
+    mkdir -p /opt/ComfyUI /tmp/triton_cache && \
+    chown -R ${USERNAME}:${USER_GID} /opt/ComfyUI /tmp/triton_cache
+
+# Den Kontext für den Rest des Builds umschalten
+USER ${USERNAME}
+
+WORKDIR /opt/ComfyUI
+
+ENV TRITON_CACHE_DIR=/tmp/triton_cache PATH="/opt/ComfyUI/venv/bin:$PATH"
+
+# 1. ComfyUI klonen
+
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git . && \
+    #ComfyUI Manager klonen
+    git clone https://github.com/Comfy-Org/ComfyUI-Manager.git custom_nodes/ComfyUI-Manager && \
+	#Workspace Manager klonen
+    git clone https://github.com/11cafe/comfyui-workspace-manager.git custom_nodes/ComfyUI-Workspace-Manager && \
+    # Dependencies installieren
+	python3 -m venv venv && \
+    pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -r custom_nodes/ComfyUI-Manager/requirements.txt && \
+    pip install --no-cache-dir -r custom_nodes/ComfyUI-Workspace-Manager/requirements.txt
+
+# --- STAGE 2: Builder-Optimized (Kernels) ---
+FROM stage-base AS stage-extended
+
+ARG TORCH_CUDA_ARCH_LIST
+ARG FORCE_CUDA
+ARG NUNCHAKU_INSTALL_MODE 
+ARG MAX_JOBS
+ARG USERNAME
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build python3-dev && \
+    rm -rf /tmp/* /var/lib/apt/lists/*
+
+USER ${USERNAME}
+
+RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/sage && \
+    cd /tmp/sage && python3 setup.py install && \
+    # Nunchaku
+    git clone --recursive https://github.com/nunchaku-tech/nunchaku.git /tmp/nunchaku && \
+    cd /tmp/nunchaku && python3 setup.py install && \
+    rm -rf /tmp/* 
+
+# --- STAGE 3: Builder-Heavy (Extension Loop) ---
+FROM stage-extended AS stage-heavy
+ARG TORCH_CUDA_ARCH_LIST
+ARG FORCE_CUDA
+ARG MAX_JOBS
+ARG USERNAME
+
+USER root
+
+RUN apt-get install -y --no-install-recommends build-essential ninja-build python3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+USER ${USERNAME}
+
+COPY extension_nodes.list /tmp/ 
+
+RUN export GIT_TERMINAL_PROMPT=0 && \
+    if [ -f /tmp/extension_nodes.list ]; then \
+        # Wir streamen den gesäuberten Inhalt direkt in den Loop, ohne die Datei zu ändern
+        sed 's/\r//g; s/[[:space:]]*$//' /tmp/extension_nodes.list | while IFS= read -r repo || [ -n "$repo" ]; do \
+            case "$repo" in \#*|"") continue ;; esac; \
+            dir_name=$(basename "$repo" .git) && \
+            echo "Cloning $repo into custom_nodes/$dir_name..." && \
+            git clone --depth 1 "$repo" "custom_nodes/$dir_name" || { echo "Failed to clone $repo"; exit 1; }; \
+            if [ -f "custom_nodes/$dir_name/requirements.txt" ]; then \
+                pip install --no-cache-dir -r "custom_nodes/$dir_name/requirements.txt"; \
+            fi; \
+        done; \
+    fi
+
+# --- STAGE 4: Final Target Selection ---
+FROM stage-${BUILD_TARGET} AS builder-source
+
+# --- STAGE 5: Final Runtime ---
+FROM ${TARGET_IMAGE} AS final
+
+# ARGs re-aktivieren (Wichtig für das Scoping!)
+ARG USERNAME
+ARG USER_UID
+ARG USER_GID
+
+# ENV Zuweisung (Jetzt ohne Tippfehler)
+ENV USERNAME=${USERNAME} \
+    USER_UID=${USER_UID} \
+    USER_GID=${USER_GID} \
+    PATH="/opt/ComfyUI/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 
+
+RUN export G_OLD=$(getent group ${USER_GID} | cut -d: -f1) && \
+    if [ -n "$G_OLD" ]; then \
+        [ "$G_OLD" != "${USERNAME}" ] && groupmod -n ${USERNAME} "$G_OLD"; \
+    else \
+        groupadd -g ${USER_GID} ${USERNAME}; \
+    fi && \
+    export U_OLD=$(getent passwd ${USER_UID} | cut -d: -f1) && \
+    if [ -n "$U_OLD" ]; then \
+        if [ "$U_OLD" != "${USERNAME}" ]; then \
+            usermod -l ${USERNAME} -d /home/${USERNAME} -m -s /bin/bash "$U_OLD"; \
+        fi; \
+    else \
+        useradd -m -u ${USER_UID} -g ${USER_GID} -s /bin/bash ${USERNAME}; \
+    fi && \
+    mkdir -p /opt/ComfyUI /tmp/triton_cache && \
+    chown -R ${USERNAME}:${USER_GID} /opt/ComfyUI /tmp/triton_cache && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg libgl1 libglib2.0-0 sudo \
+    # Deine Werkzeuge für On-the-fly Compiles:
+    build-essential ninja-build python3-dev && \
+    # Sicherheit
+    passwd -l root && \
+    rm -rf /var/lib/apt/lists/*
+
+
+USER ${USERNAME}
+
+WORKDIR /opt/ComfyUI
+
+# ARTIFACT TRANSFER: Alles aus dem Builder rüberziehen
+COPY --from=builder-source --chown=${USER_UID}:${USER_GID} /opt/ComfyUI /opt/ComfyUI
+
+EXPOSE 8188
+# Startbefehl
+ENTRYPOINT ["python3", "main.py", "--listen", "0.0.0.0"]

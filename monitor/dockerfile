@@ -1,0 +1,25 @@
+FROM python:3.14-slim
+
+RUN groupadd -r monitoruser && useradd -r -g monitoruser monitoruser
+
+# Arbeitsverzeichnis
+WORKDIR /app
+
+# Abhängigkeiten installieren
+RUN pip install --no-cache-dir \
+    websocket-client \
+    requests \
+    prometheus-client
+
+# Skript kopieren
+COPY --chown=monitoruser:monitoruser main.py .
+USER monitoruser
+# Standard-Umgebungsvariablen
+ENV COMFY_HOST=comfy-app:8188
+ENV METRICS_PORT=9000
+
+# Prometheus Port
+EXPOSE 9000
+
+# Sauberer Aufruf mit explizitem Python3 und unbuffered Output
+ENTRYPOINT ["python3", "-u", "main.py"]

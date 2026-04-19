@@ -1,0 +1,113 @@
+services:
+  # --- CORE GENERATION WORKER ---
+  comfy-worker:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+    image: rspilka/comfy:comfy-blackwell-heavy
+    container_name: comfy-worker-heavy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: '4gb'
+    ports:
+      - "8188:8188"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - RESTART_INTERVAL=${RESTART_INTERVAL:-15}
+      - TRITON_CACHE_DIR=/opt/ComfyUI/.triton_cache
+    volumes:
+      # --- LOCAL WINDOWS PARTITION MAPPINGS ---
+      - ./custom_nodes:/opt/ComfyUI/custom_nodes
+      - ./models:/opt/ComfyUI/models              # YOUR MAIN WINDOWS MODELS FOLDER
+      - ./output:/opt/ComfyUI/output
+      - ${TMP:-${TEMP:-/tmp/triton_cache}}:/opt/ComfyUI/.triton_cache
+      
+      # --- SEPARATE NAS MOUNT POINTS (Mapped to /nas) ---
+      - nas_models:/nas/models
+    restart: unless-stopped
+
+  # --- OUTPUT GALLERY ---
+  gallery:
+    image: filebrowser/filebrowser:latest
+    container_name: comfy-gallery
+    ports:
+      - "8080:80"
+    volumes:
+      - ./output:/srv
+      - ./config/filebrowser.db:/database.db
+    restart: unless-stopped
+
+  # --- MONITORING: SYSTEM ---
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+    ports:
+      - "9100:9100"
+
+  # --- MONITORING: GPU (RTX 5070 Ti) ---
+  gpu-exporter:
+    image: utkuozdemir/nvidia_gpu_exporter:1.4.1
+    container_name: gpu-exporter
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "9835:9835"
+
+  # --- MONITORING: WORKFLOW BRIDGE ---
+  pushgateway:
+    image: prom/pushgateway:latest
+    container_name: pushgateway
+    ports:
+      - "9091:9091"
+
+  # --- MONITORING: PROMETHEUS ---
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./config/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    ports:
+      - "9090:9090"
+
+  # --- MONITORING: GRAFANA ---
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  # NAS CIFS Volumes (Mounted to /nas in the container)
+  nas_models:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//diskstation.buchberg31.at/software/AI/models"
+      o: "addr=diskstation.buchberg31.at,username=comfy,password=blackwell26,vers=3.0,uid=1000,gid=1000"
+
